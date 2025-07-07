@@ -1,0 +1,6 @@
+aiogram==3.0.0b7
+psycopg2-binary
+python-dotenv
+openai
+tiktoken
+aiohttp
