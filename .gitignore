@@ -2,5 +2,8 @@
 .env
 node_modules/
 __pycache__/
+venv/
 *.log
 .DS_Store
+bot_v2.py
+old_bot.py

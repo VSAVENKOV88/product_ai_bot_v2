@@ -1,6 +1,9 @@
 aiogram==3.0.0b7
+aiohttp==3.8.4 --prefer-binary
 psycopg2-binary
 python-dotenv
 openai
 tiktoken
 aiohttp
+sentence-transformers
+numpy
