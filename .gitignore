@@ -7,3 +7,4 @@ venv/
 .DS_Store
 bot_v2.py
 old_bot.py
+myvenv/

@@ -6,21 +6,21 @@ import logging
 import numpy as np
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters.command import Command
-from aiogram.filters.state import State, StatesGroup
-from aiogram.fsm.context import FSMContext
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from openai import OpenAI, OpenAIError
 import tiktoken
 import traceback
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from aiogram.exceptions import TelegramBadRequest
+import datetime
+import re
 
 # Загрузка переменных окружения из .env
 load_dotenv()
 
 # Получение конфигурации
 SECRET_INVITE_TOKEN = os.getenv("SECRET_INVITE_TOKEN")
-ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS").split(",")] if os.getenv("ADMIN_IDS") else []
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_HOST = os.getenv("DB_HOST")
@@ -48,19 +48,33 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Состояния для администратора
-class AdminState(StatesGroup):
-    ADD_ACCESS = State()
-    REMOVE_ACCESS = State()
-    ADD_ADMIN = State()
-    REMOVE_ADMIN = State()
+# Словари для хранения состояния пользователей
+user_system_prompts = {}  # user_id: prompt_text
+chat_contexts = {}        # (chat_id, user_id): message_history
 
-# Системные промты
-system_promt_data = """
-    Ты помощник аналитика. Ответь на вопрос пользователя, используя ТОЛЬКО предоставленные данные. 
-    Учитывай контекст диалога при формировании ответа.
-    Если в данных нет информации для ответа, скажи 'Нет информации'.
-"""
+def get_current_date():
+    moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
+    return datetime.datetime.now(moscow_tz).strftime("%Y-%m-%d")
+
+# Функция загрузки промта из БД по имени
+def load_prompt_by_name(prompt_name):
+    """Загружает системный промт из базы данных по имени"""
+    try:
+        conn = create_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT content FROM promt_data WHERE name = %s", (prompt_name,))
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result:
+            logger.info(f"Промт '{prompt_name}' успешно загружен из БД")
+            return result[0]
+        else:
+            logger.error(f"Промт '{prompt_name}' не найден в базе данных")
+            return None
+    except Exception as e:
+        logger.error(f"Ошибка загрузки промта '{prompt_name}': {str(e)}")
+        return None
 
 # Инициализация токенизатора
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -75,16 +89,62 @@ def create_db_connection():
         port=DB_PORT
     )
 
-async def vector_search(question_embedding, limit=15):
+def init_access_table():
+    """Создает таблицу для контроля доступа, если она не существует"""
+    try:
+        conn = create_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS access_control (
+                user_id BIGINT PRIMARY KEY,
+                username VARCHAR(255),
+                full_name VARCHAR(255),
+                is_allowed BOOLEAN DEFAULT FALSE
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка инициализации таблицы доступа: {str(e)}")
+
+def get_user_access(user_id):
+    """Проверяет наличие доступа у пользователя"""
+    try:
+        conn = create_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT is_allowed FROM access_control WHERE user_id = %s', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else False
+    except Exception as e:
+        logger.error(f"Ошибка получения доступа пользователя {user_id}: {str(e)}")
+        return False
+
+def set_user_access(user_id, username, full_name, is_allowed=True):
+    """Устанавливает доступ для пользователя"""
+    try:
+        conn = create_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO access_control (user_id, username, full_name, is_allowed)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                is_allowed = EXCLUDED.is_allowed
+        ''', (user_id, username, full_name, is_allowed))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Ошибка установки доступа для пользователя {user_id}: {str(e)}")
+
+async def vector_search(question_embedding, limit=24):
     """Выполняет векторный поиск в базе данных"""
     try:
         connection = create_db_connection()
         cursor = connection.cursor()
         
-        # Фиксированный запрос векторного поиска
         sql = """
-            SELECT TO_CHAR(date, 'YYYY-MM-DD') AS date_str, company, summary
-            FROM ai_product_comp
+            SELECT TO_CHAR(date, 'YYYY-MM-DD') AS date_str, chunk_text
+            FROM article_chunks
             ORDER BY embedding <-> %s::vector
             LIMIT %s
         """
@@ -102,110 +162,17 @@ async def vector_search(question_embedding, limit=15):
         logger.error(f"Ошибка векторного поиска: {str(e)}")
         return []
 
-# Функции управления доступом
-def init_access_table():
-    try:
-        conn = create_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS access_control (
-                user_id BIGINT PRIMARY KEY,
-                username VARCHAR(255),
-                full_name VARCHAR(255),
-                is_allowed BOOLEAN DEFAULT FALSE,
-                is_admin BOOLEAN DEFAULT FALSE
-            )
-        ''')
-        # Добавляем администраторов
-        for admin_id in ADMIN_IDS:
-            cursor.execute('''
-                INSERT INTO access_control (user_id, is_allowed, is_admin)
-                VALUES (%s, TRUE, TRUE)
-                ON CONFLICT (user_id) DO UPDATE SET is_admin = EXCLUDED.is_admin
-            ''', (admin_id,))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Ошибка инициализации таблицы доступа: {str(e)}")
-
-def get_user_access(user_id):
-    try:
-        conn = create_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT is_allowed, is_admin FROM access_control WHERE user_id = %s', (user_id,))
-        result = cursor.fetchone()
-        conn.close()
-        return result or (False, False)
-    except Exception as e:
-        logger.error(f"Ошибка получения доступа пользователя {user_id}: {str(e)}")
-        return False, False
-
-def set_user_access(user_id, username, full_name, is_allowed=True, is_admin=False):
-    try:
-        conn = create_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO access_control (user_id, username, full_name, is_allowed, is_admin)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET
-                is_allowed = EXCLUDED.is_allowed,
-                is_admin = EXCLUDED.is_admin
-        ''', (user_id, username, full_name, is_allowed, is_admin))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Ошибка установки доступа для пользователя {user_id}: {str(e)}")
-
-def get_all_users():
-    try:
-        conn = create_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id, username, full_name, is_allowed, is_admin FROM access_control')
-        users = cursor.fetchall()
-        conn.close()
-        return users
-    except Exception as e:
-        logger.error(f"Ошибка получения списка пользователей: {str(e)}")
-        return []
-
 # Подсчет токенов
 def count_tokens(text):
     return len(tokenizer.encode(text))
 
-# Разделение данных на чанки
-def split_data(data, max_tokens=45000):
-    try:
-        chunks = []
-        current_chunk = []
-        current_tokens = 0
-        
-        for item in data:
-            item_tokens = count_tokens(json.dumps(item, ensure_ascii=False))
-            
-            if current_tokens + item_tokens > max_tokens:
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = [item]
-                current_tokens = item_tokens
-            else:
-                current_chunk.append(item)
-                current_tokens += item_tokens
-        
-        if current_chunk:
-            chunks.append(current_chunk)
-        
-        return chunks
-    except Exception as e:
-        logger.error(f"Ошибка разделения данных: {str(e)}")
-        return [data]
-
 # Обработка чанка данных с учетом контекста
-async def process_data_chunk(chunk, chat_context, user_message):
+async def process_data_chunk(chunk, chat_context, user_message, system_prompt):
     try:
         chunk_json = json.dumps(chunk, ensure_ascii=False)
         
         # Формируем сообщения с учетом контекста диалога
-        messages = [{"role": "system", "content": system_promt_data}]
+        messages = [{"role": "system", "content": system_prompt}]
         
         # Добавляем историю диалога
         for msg in chat_context:
@@ -260,17 +227,36 @@ async def get_text_embedding(text):
     return embedding / np.linalg.norm(embedding)  # Нормализация для L2-расстояния
 
 # Основная функция обработки запроса
-async def handle_user_query(user_message, chat_id, chat_context):
+async def handle_user_query(user_message, message, chat_context, user_id):
     try:
-        # 1. Генерация эмбеддинга для вопроса
-        await bot.send_message(chat_id, '🔍 Анализирую вопрос...')
+        # Получаем текущий промт пользователя
+        current_prompt = user_system_prompts.get(user_id)
+        if not current_prompt:
+            # Если промт не установлен, используем BDM по умолчанию
+            current_prompt = load_prompt_by_name('bdm_promt') or ""
+            user_system_prompts[user_id] = current_prompt
+        
+        # Отправляем промежуточные сообщения с reply
+        status_msg = await bot.send_message(
+            message.chat.id, 
+            '🔍 Анализирую вопрос...', 
+            reply_to_message_id=message.message_id
+        )
         question_embedding = await get_text_embedding(user_message)
         
-        # 2. Выполнение векторного поиска
-        await bot.send_message(chat_id, '🔎 Ищу в базе знаний...')
+        await bot.edit_message_text(
+            '🔮 Ищу в базе знаний...', 
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id
+        )
         search_results = await vector_search(question_embedding)
         
         if not search_results:
+            await bot.edit_message_text(
+                "По вашему запросу ничего не найдено.",
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id
+            )
             return "По вашему запросу ничего не найдено."
         
         # 3. Форматирование результатов для ИИ
@@ -279,15 +265,16 @@ async def handle_user_query(user_message, chat_id, chat_context):
             formatted_results.append(
                 f"Результат {i}:\n"
                 f"Дата: {result['date_str']}\n"
-                f"Компания: {result['company']}\n"
-                f"Описание: {result['summary']}\n"
+                f"Описание: {result['chunk_text']}\n"
             )
         
         context_str = "\n\n".join(formatted_results)
         
         # 4. Формирование запроса к ИИ
+        current_date = get_current_date()
+        
         messages = [
-            {"role": "system", "content": system_promt_data},
+            {"role": "system", "content": f"Текущая системная дата: {current_date}\n{current_prompt}"},
             *format_chat_context(chat_context),
             {"role": "user", "content": f"""
                 Контекст диалога: {format_chat_context(chat_context)}
@@ -299,22 +286,34 @@ async def handle_user_query(user_message, chat_id, chat_context):
         ]
         
         # 5. Запрос к ИИ для формирования ответа
-        await bot.send_message(chat_id, '🧠 Формирую ответ...')
+        await bot.edit_message_text(
+            '💽 Формирую ответ...', 
+            chat_id=status_msg.chat.id,
+            message_id=status_msg.message_id
+        )
         response = client.chat.completions.create(
-            model="deepseek-reasoner",
-            max_tokens=1500,
+            model="deepseek-chat",
+            max_tokens=1000,
             messages=messages,
             stream=False,
         )
         
-        return response.choices[0].message.content
+        result = response.choices[0].message.content
+        
+        # Удаляем статусное сообщение
+        try:
+            await bot.delete_message(status_msg.chat.id, status_msg.message_id)
+        except Exception:
+            pass
+            
+        return result
     
     except Exception as e:
         logger.error(f"Ошибка обработки запроса: {str(e)}\n{traceback.format_exc()}")
         return "Произошла ошибка при обработке запроса. Пожалуйста, попробуйте еще раз."
 
 # Хэндлер на команду /start
-@dp.message(Command("start"))
+@dp.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: types.Message):
     try:
         user_id = message.from_user.id
@@ -328,249 +327,198 @@ async def cmd_start(message: types.Message):
                 full_name=message.from_user.full_name,
                 is_allowed=True
             )
+            # Устанавливаем промт по умолчанию (BDM)
+            default_prompt = load_prompt_by_name('bdm_promt') or ""
+            user_system_prompts[user_id] = default_prompt
+            
             await message.answer('''🤖 Привет! 
-Я твой личный AI-эксперт по анализу продуктов и сервисов конкурентов.
 
-💡 Задавай вопросы как человеку, например:
-• "Какие продукты выпустил Т-Банк за последний месяц"
-• "Что нового сделал Сбер"
+🤖 Я твой личный AI-помощник
+───────────────────────
+Имею доступ к:
+📈 Аналитике Альфа Инвестиций (прочитал более 1000 статей)
+💼 Каталогу продуктов
+⚡ Готовым инструментам
 
+Просто запроси:
+• "Справка по SBER"
+• "Скрипт: [аналитика] + [продукт]"
+• "Стратегия: [профиль риска]"
+
+Данные только из хранилища Альфа ✅
+───────────────────────
+✨ Экономь время. Укрепляй экспертизу. Бусти продажи!
 ''')
+            # Предлагаем выбрать роль
+            await show_role_menu(message.chat.id)
         else:
             # Проверяем есть ли доступ у пользователя
-            is_allowed, _ = get_user_access(user_id)
-            if is_allowed:
+            if get_user_access(user_id):
+                # Устанавливаем промт по умолчанию если еще не установлен
+                if user_id not in user_system_prompts:
+                    default_prompt = load_prompt_by_name('bdm_promt') or ""
+                    user_system_prompts[user_id] = default_prompt
+                    
                 await message.answer('''🤖 С возвращением! 
 Вы уже имеете доступ к боту. Можете задавать вопросы.''')
+                # Предлагаем выбрать роль
+                await show_role_menu(message.chat.id)
             else:
                 await message.answer("⛔ Доступ запрещен. Используйте правильную пригласительную ссылку.")
     except Exception as e:
         logger.error(f"Ошибка в обработке /start: {str(e)}\n{traceback.format_exc()}")
 
-# Административные команды
-@dp.message(Command("admin"))
-async def admin_panel(message: types.Message, state: FSMContext):
-    try:
-        user_id = message.from_user.id
-        _, is_admin = get_user_access(user_id)
+# Показ меню выбора роли
+async def show_role_menu(chat_id):
+    builder = InlineKeyboardBuilder()
+    builder.add(types.InlineKeyboardButton(
+        text="Аналитик", 
+        callback_data="role_expert")
+    )
+    builder.add(types.InlineKeyboardButton(
+        text="ИК", 
+        callback_data="role_bdm")
+    )
+    builder.add(types.InlineKeyboardButton(
+        text="Продакт", 
+        callback_data="role_product")
+    )
+    builder.adjust(1)  # По одной кнопке в строке
+    await bot.send_message(
+        chat_id,
+        "👥 Выбери, кто тебе нужен?",
+        reply_markup=builder.as_markup()
+    )
+
+# Обработчик выбора роли
+@dp.callback_query(F.data.startswith("role_"))
+async def select_role(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    role_type = callback.data.split("_")[1]
+    
+    # Соответствие callback-данных именам промтов в БД
+    role_mapping = {
+        "expert": "expert_promt",
+        "bdm": "bdm_promt",
+        "product": "product_expert"
+    }
+    
+    if role_type in role_mapping:
+        prompt_name = role_mapping[role_type]
+        new_prompt = load_prompt_by_name(prompt_name)
         
-        if not is_admin:
-            await message.answer("⛔ У вас нет прав администратора")
-            return
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📊 Список пользователей", callback_data="user_list")],
-            [InlineKeyboardButton(text="➕ Добавить доступ", callback_data="add_access"),
-             InlineKeyboardButton(text="➖ Удалить доступ", callback_data="remove_access")],
-            [InlineKeyboardButton(text="👑 Добавить админа", callback_data="add_admin"),
-             InlineKeyboardButton(text="👑 Удалить админа", callback_data="remove_admin")]
-        ])
-        
-        await message.answer("⚙️ Панель администратора:", reply_markup=keyboard)
-        await state.clear()
-    except Exception as e:
-        logger.error(f"Ошибка в админ-панели: {str(e)}\n{traceback.format_exc()}")
+        if new_prompt:
+            user_system_prompts[user_id] = new_prompt
+            role_names = {
+                "expert": "Аналитик",
+                "bdm": "ИК",
+                "product": "Продакт"
+            }
+            await callback.answer(f"Роль изменена на: {role_names[role_type]}")
+            await callback.message.edit_text(
+                f"✅ Теперь ты общаешься с {role_names[role_type]}!\n"
+                "Задавай свой вопрос или используй /role чтобы изменить роль"
+            )
+        else:
+            await callback.answer("Ошибка загрузки роли. Попробуйте позже.")
+    else:
+        await callback.answer("Неизвестная роль")
 
-@dp.callback_query(F.data == "user_list")
-async def list_users(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        users = get_all_users()
-        if not users:
-            await callback.message.answer("ℹ️ Нет пользователей в базе")
-            return
-        
-        response = "👥 Список пользователей:\n\n"
-        for user in users:
-            user_id, username, full_name, is_allowed, is_admin = user
-            status = "✅ Доступен" if is_allowed else "⛔ Заблокирован"
-            role = "👑 Админ" if is_admin else "👤 Пользователь"
-            response += f"{full_name} (@{username})\nID: {user_id}\n{status} | {role}\n\n"
-        
-        await callback.message.edit_text(response)
-    except Exception as e:
-        logger.error(f"Ошибка в списке пользователей: {str(e)}\n{traceback.format_exc()}")
-        await callback.answer("Ошибка при получении списка пользователей", show_alert=True)
-
-@dp.callback_query(F.data == "add_access")
-async def add_access(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        await callback.message.edit_text(
-            text="👤 Введите ID пользователя для предоставления доступа:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
-            ])
-        )
-        await state.set_state(AdminState.ADD_ACCESS)
-    except Exception as e:
-        logger.error(f"Ошибка в add_access: {str(e)}\n{traceback.format_exc()}")
-        await callback.answer("Ошибка при обработке", show_alert=True)
-
-@dp.callback_query(F.data == "remove_access")
-async def remove_access(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        await callback.message.edit_text(
-            text="👤 Введите ID пользователя для отзыва доступа:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
-            ])
-        )
-        await state.set_state(AdminState.REMOVE_ACCESS)
-    except Exception as e:
-        logger.error(f"Ошибка в remove_access: {str(e)}\n{traceback.format_exc()}")
-        await callback.answer("Ошибка при обработке", show_alert=True)
-
-@dp.callback_query(F.data == "add_admin")
-async def add_admin(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        await callback.message.edit_text(
-            text="👑 Введите ID пользователя для назначения администратором:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
-            ])
-        )
-        await state.set_state(AdminState.ADD_ADMIN)
-    except Exception as e:
-        logger.error(f"Ошибка в add_admin: {str(e)}\n{traceback.format_exc()}")
-        await callback.answer("Ошибка при обработке", show_alert=True)
-
-@dp.callback_query(F.data == "remove_admin")
-async def remove_admin(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        await callback.message.edit_text(
-            text="👑 Введите ID администратора для разжалования:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back")]
-            ])
-        )
-        await state.set_state(AdminState.REMOVE_ADMIN)
-    except Exception as e:
-        logger.error(f"Ошибка в remove_admin: {str(e)}\n{traceback.format_exc()}")
-        await callback.answer("Ошибка при обработке", show_alert=True)
-
-# Обработка ввода ID для административных действий
-@dp.message(AdminState.ADD_ACCESS)
-async def handle_add_access(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text)
-        set_user_access(
-            user_id=user_id,
-            username="manual_add",
-            full_name="Manual Add",
-            is_allowed=True
-        )
-        await message.answer(f"✅ Пользователю {user_id} предоставлен доступ")
-        await state.clear()
-    except ValueError:
-        await message.answer("❌ Неверный формат ID. Введите числовой ID пользователя.")
-    except Exception as e:
-        logger.error(f"Ошибка в handle_add_access: {str(e)}\n{traceback.format_exc()}")
-        await message.answer("❌ Ошибка при добавлении доступа")
-
-@dp.message(AdminState.REMOVE_ACCESS)
-async def handle_remove_access(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text)
-        set_user_access(
-            user_id=user_id,
-            username="manual_add",
-            full_name="Manual Add",
-            is_allowed=False
-        )
-        await message.answer(f"⛔ Пользователю {user_id} отозван доступ")
-        await state.clear()
-    except ValueError:
-        await message.answer("❌ Неверный формат ID. Введите числовой ID пользователя.")
-    except Exception as e:
-        logger.error(f"Ошибка в handle_remove_access: {str(e)}\n{traceback.format_exc()}")
-        await message.answer("❌ Ошибка при отзыве доступа")
-
-@dp.message(AdminState.ADD_ADMIN)
-async def handle_add_admin(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text)
-        set_user_access(
-            user_id=user_id,
-            username="admin_add",
-            full_name="Admin Add",
-            is_allowed=True,
-            is_admin=True
-        )
-        await message.answer(f"👑 Пользователь {user_id} назначен администратором")
-        await state.clear()
-    except ValueError:
-        await message.answer("❌ Неверный формат ID. Введите числовой ID пользователя.")
-    except Exception as e:
-        logger.error(f"Ошибка в handle_add_admin: {str(e)}\n{traceback.format_exc()}")
-        await message.answer("❌ Ошибка при назначении администратора")
-
-@dp.message(AdminState.REMOVE_ADMIN)
-async def handle_remove_admin(message: types.Message, state: FSMContext):
-    try:
-        user_id = int(message.text)
-        set_user_access(
-            user_id=user_id,
-            username="admin_remove",
-            full_name="Admin Remove",
-            is_admin=False
-        )
-        await message.answer(f"👤 Пользователь {user_id} больше не администратор")
-        await state.clear()
-    except ValueError:
-        await message.answer("❌ Неверный формат ID. Введите числовой ID пользователя.")
-    except Exception as e:
-        logger.error(f"Ошибка в handle_remove_admin: {str(e)}\n{traceback.format_exc()}")
-        await message.answer("❌ Ошибка при снятии прав администратора")
-
-@dp.callback_query(F.data == "admin_back")
-async def admin_back(callback: types.CallbackQuery, state: FSMContext):
-    try:
-        await state.clear()
-        await admin_panel(callback.message, state)
-    except Exception as e:
-        logger.error(f"Ошибка в admin_back: {str(e)}\n{traceback.format_exc()}")
-        await callback.answer("Ошибка при возврате в меню", show_alert=True)
-
-# Хранилище контекста по чатам
-chat_contexts = {}
+# Хэндлер на команду /role
+@dp.message(Command("role"), F.chat.type == "private")
+async def cmd_role(message: types.Message):
+    user_id = message.from_user.id
+    if get_user_access(user_id):
+        await show_role_menu(message.chat.id)
+    else:
+        await message.answer("⛔ У вас нет доступа к этой команде")
 
 # Основной обработчик сообщений
 @dp.message()
 async def send(message: types.Message):
     try:
+        # Пропускаем сообщения от ботов
+        if message.from_user.is_bot:
+            return
+            
         # Пропускаем команды
         if message.text and message.text.startswith('/'):
             return
             
         user_id = message.from_user.id
         
+        # Логируем полученное сообщение
+        logger.info(f"Получено сообщение: chat_id={message.chat.id}, user_id={user_id}, text={message.text}")
+        logger.info(f"Тип чата: {message.chat.type}")
+        
         # Проверка доступа
-        is_allowed, _ = get_user_access(user_id)
-        if not is_allowed:
-            await message.answer("🔒 Доступ только по приглашению. Используйте пригласительную ссылку для активации.")
+        if not get_user_access(user_id):
+            logger.info(f"Пользователь {user_id} не имеет доступа")
+            # В группе не отвечаем, в личке предупреждаем
+            if message.chat.type == "private":
+                await message.answer("🔒 Доступ только по приглашению. Используйте пригласительную ссылку для активации.")
             return
             
+        # Обработка групповых чатов
+        text = message.text or ""
+        is_private = message.chat.type == "private"
+        bot_username = (await bot.get_me()).username
+        mentioned = False
+        is_reply = False
+        
+        if not is_private:
+            # Проверяем упоминание бота
+            if bot_username:
+                # Ищем упоминание в любом месте сообщения
+                pattern = re.compile(fr'@?{re.escape(bot_username)}', re.IGNORECASE)
+                if pattern.search(text):
+                    mentioned = True
+                    # Удаляем упоминание из текста
+                    text = pattern.sub('', text, count=1).strip()
+            
+            # Проверяем, является ли сообщение ответом на сообщение бота
+            if message.reply_to_message and message.reply_to_message.from_user.id == bot.id:
+                is_reply = True
+            
+            logger.info(f"Упоминание: {mentioned}, Ответ: {is_reply}")
+            
+            # Если нет ни упоминания, ни ответа, то игнорируем
+            if not (mentioned or is_reply):
+                logger.info("Сообщение не содержит упоминания или ответа на бота - игнорируем")
+                return
+        else:
+            # В личных сообщениях обрабатываем все
+            mentioned = True
+        
+        # Если после удаления упоминания текст пуст, игнорируем
+        if not text:
+            logger.info("Текст пуст после удаления упоминания - игнорируем")
+            return
+            
+        logger.info(f"Обрабатываем сообщение: {text}")
         await asyncio.sleep(1)
-        await message.answer('готовлю ответ ⏳')
         
-        chat_id = message.chat.id
+        # Ключ контекста: (chat_id, user_id)
+        context_key = (message.chat.id, user_id)
         
-        # Инициализация контекста для нового чата
-        if chat_id not in chat_contexts:
-            chat_contexts[chat_id] = []
+        # Инициализация контекста для нового пользователя/чата
+        if context_key not in chat_contexts:
+            chat_contexts[context_key] = []
         
         # Добавляем текущее сообщение пользователя в контекст
         user_message = {
             "role": "user",
-            "content": message.text
+            "content": text
         }
-        chat_contexts[chat_id].append(user_message)
+        chat_contexts[context_key].append(user_message)
         
         try:
             # Обработка запроса
             ai_answer = await handle_user_query(
-                user_message=message.text,
-                chat_id=chat_id,
-                chat_context=chat_contexts[chat_id]
+                user_message=text,
+                message=message,
+                chat_context=chat_contexts[context_key],
+                user_id=user_id
             )
             
             # Добавляем ответ ИИ в контекст
@@ -578,12 +526,17 @@ async def send(message: types.Message):
                 "role": "assistant",
                 "content": ai_answer
             }
-            chat_contexts[chat_id].append(ai_message)
+            chat_contexts[context_key].append(ai_message)
             
-            await message.answer(ai_answer, parse_mode="markdown")
+            # Отправка ответа с reply
+            try:
+                await message.reply(ai_answer, parse_mode="Markdown")
+            except TelegramBadRequest:
+                await message.reply(ai_answer)  # Отправка без Markdown
+            
         except Exception as ex:
             logger.error(f"Ошибка обработки запроса: {str(ex)}\n{traceback.format_exc()}")
-            await message.answer("Ошибка в обработке данных. Попробуйте еще раз")
+            await message.reply("Ошибка в обработке данных. Попробуйте еще раз")
     
     except Exception as e:
         logger.error(f"Критическая ошибка в обработчике send: {str(e)}\n{traceback.format_exc()}")
@@ -593,7 +546,7 @@ async def main():
     try:
         # Инициализация системы доступа
         init_access_table()
-        logger.info("Бот запущен и готов к работе")
+        logger.info("Бот запущен")
         await dp.start_polling(bot)
     except Exception as e:
         logger.error(f"Критическая ошибка при запуске бота: {str(e)}\n{traceback.format_exc()}")
