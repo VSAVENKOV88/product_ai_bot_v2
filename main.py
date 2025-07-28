@@ -312,6 +312,14 @@ async def handle_user_query(user_message, message, chat_context, user_id):
         logger.error(f"Ошибка обработки запроса: {str(e)}\n{traceback.format_exc()}")
         return "Произошла ошибка при обработке запроса. Пожалуйста, попробуйте еще раз."
 
+# Функция очистки контекста пользователя
+def clear_user_context(chat_id, user_id):
+    """Очищает контекст диалога для указанного пользователя в чате"""
+    context_key = (chat_id, user_id)
+    if context_key in chat_contexts:
+        del chat_contexts[context_key]
+        logger.info(f"Контекст очищен для пользователя {user_id} в чате {chat_id}")
+
 # Хэндлер на команду /start
 @dp.message(Command("start"), F.chat.type == "private")
 async def cmd_start(message: types.Message):
@@ -394,6 +402,7 @@ async def show_role_menu(chat_id):
 @dp.callback_query(F.data.startswith("role_"))
 async def select_role(callback: types.CallbackQuery):
     user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
     role_type = callback.data.split("_")[1]
     
     # Соответствие callback-данных именам промтов в БД
@@ -409,15 +418,21 @@ async def select_role(callback: types.CallbackQuery):
         
         if new_prompt:
             user_system_prompts[user_id] = new_prompt
+            # Очищаем контекст перед сменой роли
+            clear_user_context(chat_id, user_id)
+            
             role_names = {
-                "expert": "Аналитик",
+                "expert": "Аналитиком",
                 "bdm": "ИК",
-                "product": "Продакт"
+                "product": "Продактом"
             }
-            await callback.answer(f"Роль изменена на: {role_names[role_type]}")
+            role_name = role_names[role_type]
+            
+            await callback.answer(f"Роль изменена на: {role_name}")
             await callback.message.edit_text(
-                f"✅ Теперь ты общаешься с {role_names[role_type]}!\n"
-                "Задавай свой вопрос или используй /role чтобы изменить роль"
+                f"✅ Теперь ты общаешься с {role_name}!\n"
+                f"Контекст предыдущего диалога очищен.\n\n"
+                "Задавай новый вопрос или используй /role чтобы изменить роль"
             )
         else:
             await callback.answer("Ошибка загрузки роли. Попробуйте позже.")
