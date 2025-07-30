@@ -6,7 +6,7 @@ import logging
 import numpy as np
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters.command import Command
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from openai import OpenAI, OpenAIError
 import tiktoken
 import traceback
@@ -319,6 +319,17 @@ def clear_user_context(chat_id, user_id):
     if context_key in chat_contexts:
         del chat_contexts[context_key]
         logger.info(f"Контекст очищен для пользователя {user_id} в чате {chat_id}")
+        return True
+    return False
+
+# Создание меню команд
+def get_main_menu_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        types.KeyboardButton(text="/role"),
+        types.KeyboardButton(text="/clear")
+    )
+    return builder.as_markup(resize_keyboard=True)
 
 # Хэндлер на команду /start
 @dp.message(Command("start"), F.chat.type == "private")
@@ -356,7 +367,7 @@ async def cmd_start(message: types.Message):
 Данные только из хранилища Альфа ✅
 ───────────────────────
 ✨ Экономь время. Укрепляй экспертизу. Бусти продажи!
-''')
+''', reply_markup=get_main_menu_keyboard())
             # Предлагаем выбрать роль
             await show_role_menu(message.chat.id)
         else:
@@ -368,7 +379,7 @@ async def cmd_start(message: types.Message):
                     user_system_prompts[user_id] = default_prompt
                     
                 await message.answer('''🤖 С возвращением! 
-Вы уже имеете доступ к боту. Можете задавать вопросы.''')
+Вы уже имеете доступ к боту. Можете задавать вопросы.''', reply_markup=get_main_menu_keyboard())
                 # Предлагаем выбрать роль
                 await show_role_menu(message.chat.id)
             else:
@@ -447,6 +458,24 @@ async def cmd_role(message: types.Message):
         await show_role_menu(message.chat.id)
     else:
         await message.answer("⛔ У вас нет доступа к этой команде")
+
+# Хэндлер на команду /clear
+@dp.message(Command("clear"))
+async def cmd_clear(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    if not get_user_access(user_id):
+        await message.answer("⛔ У вас нет доступа к этой команде")
+        return
+    
+    # Очищаем контекст
+    cleared = clear_user_context(chat_id, user_id)
+    
+    if cleared:
+        await message.answer("✅ Контекст диалога очищен. Начните новый диалог.")
+    else:
+        await message.answer("ℹ️ Контекст уже был пуст. Можете начать новый диалог.")
 
 # Основной обработчик сообщений
 @dp.message()
