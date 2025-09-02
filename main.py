@@ -17,6 +17,13 @@ import datetime
 import re
 import time
 from weasyprint import HTML  # Для генерации PDF
+import tempfile
+import PyPDF2
+import docx
+from pathlib import Path
+import openpyxl  # Для Excel файлов
+from pptx import Presentation  # Для PowerPoint файлов
+import pandas as pd
 
 # Загрузка переменных окружения из .env
 load_dotenv()
@@ -51,6 +58,9 @@ logger = logging.getLogger(__name__)
 user_system_prompts = {}  # user_id: prompt_text
 chat_contexts = {}  # (chat_id, user_id): message_history
 user_role_types = {}  # user_id: role_type (expert, product, marketing)
+user_search_modes = {}  # user_id: search_mode (vector, context) - только для marketing
+user_last_html = {}  # user_id: last_generated_html - для роли marketing
+user_uploaded_files = {}  # user_id: {file_content: str, file_name: str, instructions: str}
 
 def get_current_date():
     moscow_tz = datetime.timezone(datetime.timedelta(hours=3))
@@ -104,7 +114,7 @@ def init_access_table():
         conn.commit()
         conn.close()
     except Exception as e:
-        logger.error(f"Ошибка инициализации таблицы доступа: {str(e)}")
+        logger.error(f"Ошибка инициализации таблица доступа: {str(e)}")
 
 def get_user_access(user_id):
     """Проверяет наличие доступа у пользователя"""
@@ -262,6 +272,62 @@ async def generate_pdf_from_html(html_content, user_id):
         logger.error(f"Ошибка генерации PDF: {str(e)}")
         raise
 
+# Функция для чтения текста из файлов разных форматов
+async def extract_text_from_file(file_path, file_type):
+    """Извлекает текст из файла в зависимости от его типа"""
+    try:
+        if file_type == 'text/plain' or file_path.endswith('.txt'):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+                
+        elif file_type == 'application/pdf' or file_path.endswith('.pdf'):
+            text = ""
+            with open(file_path, 'rb') as f:
+                pdf_reader = PyPDF2.PdfReader(f)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n"
+            return text
+            
+        elif (file_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or 
+              file_path.endswith('.docx')):
+            doc = docx.Document(file_path)
+            return "\n".join([paragraph.text for paragraph in doc.paragraphs])
+            
+        elif (file_type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' or 
+              file_path.endswith('.xlsx') or file_path.endswith('.xls')):
+            # Обработка Excel файлов
+            text = ""
+            if file_path.endswith('.xlsx'):
+                df = pd.read_excel(file_path, sheet_name=None)
+            else:
+                df = pd.read_excel(file_path, engine='xlrd', sheet_name=None)
+            
+            for sheet_name, data in df.items():
+                text += f"--- Лист: {sheet_name} ---\n"
+                text += data.to_string(index=False) + "\n\n"
+            return text
+            
+        elif (file_type == 'application/vnd.openxmlformats-officedocument.presentationml.presentation' or 
+              file_path.endswith('.pptx')):
+            # Обработка PowerPoint файлов
+            text = ""
+            prs = Presentation(file_path)
+            for i, slide in enumerate(prs.slides):
+                text += f"--- Слайд {i+1} ---\n"
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        text += shape.text + "\n"
+                text += "\n"
+            return text
+            
+        else:
+            logger.warning(f"Неизвестный тип файла: {file_type}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Ошибка чтения файла: {str(e)}")
+        return None
+
 # Основная функция обработки запроса
 async def handle_user_query(user_message, message, chat_context, user_id, bot: Bot):
     try:
@@ -280,45 +346,91 @@ async def handle_user_query(user_message, message, chat_context, user_id, bot: B
             reply_to_message_id=message.message_id
         )
         
-        question_embedding = await get_text_embedding(user_message)
-        await bot_instance.edit_message_text(
-            '🔮 Ищу в базе знаний...',
-            chat_id=status_msg.chat.id,
-            message_id=status_msg.message_id
-        )
+        # Определяем режим поиска для роли marketing
+        role_type = user_role_types.get(user_id, "expert")
+        search_mode = user_search_modes.get(user_id, "vector")  # По умолчанию векторный поиск
         
-        search_results = await vector_search(question_embedding, role_type=user_role_types.get(user_id, "expert"))
-        if not search_results:
+        if role_type == "marketing" and search_mode == "context":
+            # Режим работы только на контекста сообщения
+            context_str = ""
             await bot_instance.edit_message_text(
-                "По вашему запросу ничего не найдено.",
+                '💽 Формирую ответ на основе контекста...',
                 chat_id=status_msg.chat.id,
                 message_id=status_msg.message_id
             )
-            return "По вашему запросу ничего не найдено."
-
-        # 3. Форматирование результатов для ИИ
-        formatted_results = []
-        for i, result in enumerate(search_results, 1):
-            formatted_results.append(
-                f"Результат {i}:\n"
-                f"Дата: {result['date_str']}\n"
-                f"Описание: {result['chunk_text']}\n"
+        else:
+            # Векторный поиск для всех остальных случаев
+            question_embedding = await get_text_embedding(user_message)
+            await bot_instance.edit_message_text(
+                '🔮 Ищу в базе знаний...',
+                chat_id=status_msg.chat.id,
+                message_id=status_msg.message_id
             )
-        context_str = "\n\n".join(formatted_results)
+            
+            search_results = await vector_search(question_embedding, role_type=role_type)
+            if not search_results:
+                await bot_instance.edit_message_text(
+                    "По вашему запросу ничего не найдено.",
+                    chat_id=status_msg.chat.id,
+                    message_id=status_msg.message_id
+                )
+                return "По вашему запросу ничего не найдено."
 
-        # 4. Формирование запроса к ИИ
+            # Форматирование результатов для ИИ
+            formatted_results = []
+            for i, result in enumerate(search_results, 1):
+                formatted_results.append(
+                    f"Результат {i}:\n"
+                    f"Дата: {result['date_str']}\n"
+                    f"Описание: {result['chunk_text']}\n"
+                )
+            context_str = "\n\n".join(formatted_results)
+
+        # Формирование запроса к ИИ
         current_date = get_current_date()
+        
+        # Для роли marketing добавляем предыдущий HTML в контекст, если он есть
         messages = [
             {"role": "system", "content": f"Текущая системная дата: {current_date}\n{current_prompt}"},
             *format_chat_context(chat_context),
-            {"role": "user", "content": f"""
-                Контекст диалога: {format_chat_context(chat_context)}
-                Релевантные данные: {context_str}
-                Вопрос: {user_message}
-            """}
         ]
+        
+        # Добавляем информацию из загруженного файла, если он есть
+        file_info = ""
+        if role_type == "marketing" and user_id in user_uploaded_files:
+            file_data = user_uploaded_files[user_id]
+            file_info = f"""
+                Загруженный файл: {file_data['file_name']}
+                Инструкции по использованию файла: {file_data.get('instructions', 'Не указаны')}
+                Содержимое файла: {file_data['file_content'][:2000]}... [файл обрезан для экономии токенов]
+            """
+        
+        # Добавляем предыдущий HTML для роли marketing, если он есть
+        if role_type == "marketing" and user_id in user_last_html and user_last_html[user_id]:
+            messages.append({
+                "role": "user", 
+                "content": f"""
+                    {file_info}
+                    Предыдущая версия HTML: {user_last_html[user_id]}
+                    Контекст диалога: {format_chat_context(chat_context)}
+                    Релевантные данные: {context_str}
+                    Вопрос: {user_message}
+                    
+                    Внеси правки в предыдущий HTML на основе нового запроса и информации из загруженного файла. Не генерируй полностью новый HTML, а модифицируй существующий.
+                """
+            })
+        else:
+            messages.append({
+                "role": "user", 
+                "content": f"""
+                    {file_info}
+                    Контекст диалога: {format_chat_context(chat_context)}
+                    Релевантные данные: {context_str}
+                    Вопрос: {user_message}
+                """
+            })
 
-        # 5. Запрос к ИИ для формирования ответа
+        # Запрос к ИИ для формирования ответа
         await bot_instance.edit_message_text(
             '💽 Формирую ответ...',
             chat_id=status_msg.chat.id,
@@ -326,8 +438,6 @@ async def handle_user_query(user_message, message, chat_context, user_id, bot: B
         )
 
         # Определяем параметры генерации в зависимости от роли
-        role_type = user_role_types.get(user_id, "expert")
-
         if role_type == "marketing":
             max_tokens = 8000
             temperature = 1.0
@@ -350,6 +460,10 @@ async def handle_user_query(user_message, message, chat_context, user_id, bot: B
         )
         result = response.choices[0].message.content
 
+        # Для роли marketing сохраняем сгенерированный HTML
+        if role_type == "marketing":
+            user_last_html[user_id] = trim_ai_answer(result)
+
         # Удаляем статусное сообщение
         try:
             await bot_instance.delete_message(status_msg.chat.id, status_msg.message_id)
@@ -367,16 +481,22 @@ def clear_user_context(chat_id, user_id):
     context_key = (chat_id, user_id)
     if context_key in chat_contexts:
         del chat_contexts[context_key]
-        logger.info(f"Контекст очищен для пользователя {user_id} в чате {chat_id}")
-        return True
-    return False
+    # Также очищаем последний HTML для пользователя
+    if user_id in user_last_html:
+        del user_last_html[user_id]
+    # Очищаем загруженные файлы
+    if user_id in user_uploaded_files:
+        del user_uploaded_files[user_id]
+    logger.info(f"Контекст, HTML и файлы очищены для пользователя {user_id} в чате {chat_id}")
+    return True
 
 # Создание меню команд
 def get_main_menu_keyboard():
     builder = ReplyKeyboardBuilder()
     builder.row(
         types.KeyboardButton(text="/role"),
-        types.KeyboardButton(text="/clear")
+        types.KeyboardButton(text="/clear"),
+        types.KeyboardButton(text="/mode")
     )
     return builder.as_markup(resize_keyboard=True)
 
@@ -399,8 +519,24 @@ async def show_role_menu(chat_id, bot: Bot):
         reply_markup=builder.as_markup()
     )
 
+# Показ меню выбора режима поиска для маркетинга
+async def show_search_mode_menu(chat_id, bot: Bot):
+    builder = InlineKeyboardBuilder()
+    builder.add(types.InlineKeyboardButton(
+        text="Поиск в БЗ", callback_data="mode_vector")
+    )
+    builder.add(types.InlineKeyboardButton(
+        text="Только контекст", callback_data="mode_context")
+    )
+    builder.adjust(1)  # По одной кнопке в строке
+    await bot.send_message(
+        chat_id,
+        "🔍 Выбери режим поиска для маркетинга:",
+        reply_markup=builder.as_markup()
+    )
+
 # Обработчик выбора роли
-async def select_role(callback: types.CallbackQuery):
+async def select_role(callback: types.CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
     role_type = callback.data.split("_")[1]
@@ -434,10 +570,38 @@ async def select_role(callback: types.CallbackQuery):
                 f"Контекст предыдущего диалога очищен.\n\n"
                 "Задавай новый вопрос или используй /role чтобы изменить роль"
             )
+            
+            # Для роли маркетинг показываем дополнительное меню выбора режима
+            if role_type == "marketing":
+                await show_search_mode_menu(chat_id, bot)
         else:
             await callback.answer("Ошибка загрузки роли. Попробуйте позже.")
     else:
         await callback.answer("Неизвестная роль")
+
+# Обработчик выбора режима поиска
+async def select_search_mode(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    mode_type = callback.data.split("_")[1]
+    
+    # Проверяем, что пользователь имеет роль маркетинг
+    if user_role_types.get(user_id) != "marketing":
+        await callback.answer("Режим поиска доступен только для роли Маркетинг")
+        return
+        
+    # Сохраняем выбранный режим
+    user_search_modes[user_id] = mode_type
+    
+    mode_names = {
+        "vector": "Поиск в БЗ",
+        "context": "Только контекст сообщения"
+    }
+    
+    await callback.answer(f"Режим поиска изменен на: {mode_names[mode_type]}")
+    await callback.message.edit_text(
+        f"✅ Режим поиска изменен на: {mode_names[mode_type]}\n\n"
+        "Теперь можно задавать вопросы или использовать /mode для изменения режима"
+    )
 
 # Хэндлер на команду /start
 async def cmd_start(message: types.Message, bot: Bot):
@@ -475,6 +639,8 @@ async def cmd_start(message: types.Message, bot: Bot):
 • Аналитик - даст экспертную справку по рынку или бумаге
 • Продакт - даст исчерпывающую информацию по продукту
 • Маркетинг - сделает тебе маркетинговый материал примерно за 3 мин. 
+
+📁 Для роли Маркетинг ты можешь загружать файлы (TXT, PDF, DOCX, XLSX, PPTX) и указывать, как их использовать.
 
 🆕 Хочешь начать с чистого листа?
 - используй команду /clear                       
@@ -514,6 +680,20 @@ async def cmd_role(message: types.Message, bot: Bot):
     else:
         await message.answer("⛔ У вас нет доступа к этой команде")
 
+# Хэндлер на команду /mode
+async def cmd_mode(message: types.Message, bot: Bot):
+    user_id = message.from_user.id
+    if not get_user_access(user_id):
+        await message.answer("⛔ У вас нет доступа к этой команде")
+        return
+        
+    # Проверяем, что пользователь имеет роль маркетинг
+    if user_role_types.get(user_id) != "marketing":
+        await message.answer("Режим поиска доступен только для роли Маркетинг")
+        return
+        
+    await show_search_mode_menu(message.chat.id, bot)
+
 # Хэндлер на команду /clear
 async def cmd_clear(message: types.Message):
     user_id = message.from_user.id
@@ -528,6 +708,76 @@ async def cmd_clear(message: types.Message):
         await message.answer("✅ Контекст диалога очищен. Начните новый диалог.")
     else:
         await message.answer("ℹ️ Контекст уже был пуст. Можете начать новый диалог.")
+
+# Обработчик загрузки файлов
+async def handle_document(message: types.Message, bot: Bot):
+    user_id = message.from_user.id
+    
+    # Проверяем, что пользователь имеет доступ и роль маркетинг
+    if not get_user_access(user_id) or user_role_types.get(user_id) != "marketing":
+        await message.answer("⛔ Загрузка файлов доступна только для роли Маркетинг с активным доступом")
+        return
+    
+    try:
+        # Получаем информацию о файле
+        file_id = message.document.file_id
+        file_name = message.document.file_name
+        mime_type = message.document.mime_type
+        
+        # Проверяем поддерживаемые форматы
+        supported_types = [
+            'text/plain', 
+            'application/pdf', 
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/vnd.ms-excel',
+            'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+        ]
+        
+        supported_extensions = ['.txt', '.pdf', '.docx', '.xlsx', '.xls', '.pptx']
+        
+        if (mime_type not in supported_types and 
+            not any(file_name.lower().endswith(ext) for ext in supported_extensions)):
+            await message.answer("❌ Поддерживаются только файлы TXT, PDF, DOCX, XLSX, XLS и PPTX форматов")
+            return
+        
+        # Скачиваем файл
+        file = await bot.get_file(file_id)
+        file_path = file.file_path
+        
+        # Создаем временную директорию для загрузки
+        os.makedirs("temp_uploads", exist_ok=True)
+        download_path = f"temp_uploads/{user_id}_{file_name}"
+        
+        # Скачиваем файл
+        await bot.download_file(file_path, download_path)
+        
+        # Извлекаем текст из файла
+        file_content = await extract_text_from_file(download_path, mime_type)
+        
+        if not file_content:
+            await message.answer("❌ Не удалось прочитать содержимое файла")
+            return
+        
+        # Сохраняем информацию о файле
+        user_uploaded_files[user_id] = {
+            'file_name': file_name,
+            'file_content': file_content,
+            'instructions': message.caption or "Не указаны"
+        }
+        
+        # Удаляем временный файл
+        os.remove(download_path)
+        
+        await message.answer(
+            f"✅ Файл '{file_name}' успешно загружен!\n"
+            f"Инструкции: {message.caption or 'Не указаны'}\n\n"
+            "Теперь задайте вопрос, и я учту информацию из файла при генерации ответа."
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки файла: {str(e)}\n{traceback.format_exc()}")
+        await message.answer("❌ Произошла ошибка при обработке файла. Попробуйте еще раз.")
 
 # Основной обработчик сообщений
 async def send(message: types.Message, bot: Bot):
@@ -625,9 +875,7 @@ async def send(message: types.Message, bot: Bot):
             if role_type == "marketing":
                 try:
                     # Генерируем PDF из HTML
-                    #print(ai_answer)
                     fix_ai_answer = trim_ai_answer(ai_answer)
-                    #print(fix_ai_answer)
                     pdf_path = await generate_pdf_from_html(fix_ai_answer, user_id)
                     
                     # Отправляем PDF файл
@@ -692,8 +940,9 @@ async def main():
         # Инициализация системы доступа
         init_access_table()
         
-        # Создаем временную директорию для PDF
+        # Создаем временные директории
         os.makedirs("temp_pdfs", exist_ok=True)
+        os.makedirs("temp_uploads", exist_ok=True)
         
         # Инициализация бота и диспетчера
         bot = Bot(token=BOT_TOKEN)
@@ -701,9 +950,12 @@ async def main():
         
         # Регистрация обработчиков
         dp.callback_query.register(select_role, F.data.startswith("role_"))
+        dp.callback_query.register(select_search_mode, F.data.startswith("mode_"))
         dp.message.register(cmd_start, Command("start"), F.chat.type == "private")
         dp.message.register(cmd_role, Command("role"), F.chat.type == "private")
+        dp.message.register(cmd_mode, Command("mode"), F.chat.type == "private")
         dp.message.register(cmd_clear, Command("clear"))
+        dp.message.register(handle_document, F.document)
         dp.message.register(send)
         
         logger.info("Бот запущен")

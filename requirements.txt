@@ -4,7 +4,11 @@ psycopg2-binary
 python-dotenv
 openai
 tiktoken
-aiohttp
 sentence-transformers
 numpy
 weasyprint
+PyPDF2
+python-docx
+openpyxl
+python-pptx
+pandas
